@@ -391,10 +391,7 @@ static int save_external_coredump(
          * to avoid crashing processes to take away too many system resources.
          * Check the cgroup settings, and set max_size to a bit less than half of the
          * available memory left to the process.
-         * Then, attempt to write the core file uncompressed first - if the write gets
-         * interrupted, we know we won't be able to write it all, so instead compress what
-         * was written so far, delete the uncompressed truncated core, and then continue
-         * compressing from STDIN. Given the compressed core cannot be larger than the
+         * Given the compressed core cannot be larger than the
          * uncompressed one, and 1KB for metadata is accounted for in the calculation, we
          * should be able to at least store the full compressed core file. */
 
@@ -428,7 +425,7 @@ static int save_external_coredump(
                 }
 
                 max_size = MIN(cgroup_limit, max_size);
-                max_size = LESS_BY(max_size, 1024U) / 2; /* Account for 1KB metadata overhead for compressing */
+                max_size = LESS_BY(max_size, 1024U); /* Account for 1KB metadata overhead for compressing */
                 max_size = MAX(PROCESS_SIZE_MIN, max_size); /* Impose a lower minimum */
 
                 /* tmpfs might get full quickly, so check the available space too.
@@ -439,12 +436,6 @@ static int save_external_coredump(
 
                 log_debug("Limiting core file size to %" PRIu64 " bytes due to cgroup memory limits.", max_size);
         }
-
-        r = copy_bytes(input_fd, fd, max_size, 0);
-        if (r < 0)
-                return log_error_errno(r, "Cannot store coredump of %s (%s): %m",
-                                context->meta[META_ARGV_PID], context->meta[META_COMM]);
-        truncated = r == 1;
 
 #if HAVE_COMPRESSION
         if (arg_compress) {
@@ -464,24 +455,9 @@ static int save_external_coredump(
                 if (fd_compressed < 0)
                         return log_error_errno(fd_compressed, "Failed to create temporary file for coredump %s: %m", fn_compressed);
 
-                r = compress_stream(fd, fd_compressed, max_size, &uncompressed_size);
+                r = compress_stream(input_fd, fd_compressed, max_size, &uncompressed_size);
                 if (r < 0)
                         return log_error_errno(r, "Failed to compress %s: %m", coredump_tmpfile_name(tmp_compressed));
-
-                if (truncated && storage_on_tmpfs) {
-                        uint64_t partial_uncompressed_size = 0;
-
-                        /* Uncompressed write was truncated and we are writing to tmpfs: delete
-                         * the uncompressed core, and compress the remaining part from STDIN. */
-
-                        tmp = unlink_and_free(tmp);
-                        fd = safe_close(fd);
-
-                        r = compress_stream(input_fd, fd_compressed, max_size, &partial_uncompressed_size);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to compress %s: %m", coredump_tmpfile_name(tmp_compressed));
-                        uncompressed_size += partial_uncompressed_size;
-                }
 
                 r = fix_permissions(fd_compressed, tmp_compressed, fn_compressed, context, uid);
                 if (r < 0)
@@ -503,6 +479,12 @@ static int save_external_coredump(
                 return 0;
         }
 #endif
+
+        r = copy_bytes(input_fd, fd, max_size, 0);
+        if (r < 0)
+                return log_error_errno(r, "Cannot store coredump of %s (%s): %m",
+                                context->meta[META_ARGV_PID], context->meta[META_COMM]);
+        truncated = r == 1;
 
         if (truncated)
                 log_struct(LOG_INFO,
